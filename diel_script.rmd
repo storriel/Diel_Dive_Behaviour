@@ -1,0 +1,607 @@
+---
+title: Calculating solar altitude and identifying diel behavioural patterns based on dissimilarity
+  in time-at-depth (TAD)
+author: "Luke Storrie"
+date: "2022/08/28"
+output:
+  html_document:
+    keep_md: yes
+  pdf_document: default
+  word_document: default
+---
+
+This script includes code for identifying diel patterns in dive behaviour from depth time series data and animal locations as used in Storrie et al. (2022) Empirically testing the influence of light regime on diel activity patterns in a marine predator reveals complex interacting factors shaping behaviour. Functional Ecology
+
+Runs on R version 4.1.2 (2021-11-01)) Platform: x86_64-w64-mingw32/x64 (64-bit)
+
+This .rmd script assumes that the script, input folder (data_inputs folder), and output folder (csv_outputs folder) files are contained within a single folder. The code here is based on analysing one individual and should be run multiple times or adapted with loops for multiple individuals.
+
+```{r}
+knitr::opts_chunk$set(echo=TRUE)
+```
+
+
+```{r load packages, include= TRUE,warning=FALSE,results = FALSE,message=FALSE}
+#Load required packages 
+library(suncalc) #v0.5.0
+library(data.table) #v1.14.2
+library(here) #v1.0.1
+library(tidyverse) #v1.3.1
+library(lubridate) #v1.8.0
+library(data.table) #v1.14.2
+library(dplyr) #v1.0.7
+```
+
+Load in location data: 
+This is a subset of CTCRW-modeled locations (at 15 min intervals) for beluga ID LC2018#3 (PTT 174962), from Aug 4th to Oct 30th 2018 (the time range shown in Fig. 4 of the manuscript). This file has four columns: 'datetime' (UTC), 'PTT' (Platform transmitter terminal, here used as an individual identifier), 'Lat' and 'Long'. 
+
+```{r load locations, include= TRUE}
+#Read in data files
+locs<-read.csv(here("data_inputs","LC2018_3_CrwLocsSub.csv"))
+locs$datetime<-as.POSIXct(locs$datetime, tz= 'UTC')
+names(locs)<-c("date","ptt","lat","lon")
+```
+
+
+CALCULATING SOLAR ALTITUDE FOR THE TIME AT EACH LOCATION 
+
+The following code calculates the solar altitude (degrees relative to the horizon) for each location based on datetime, latitude, and longitude (the data frame produced here is called 'sun_angle'). This is all that is needed to continue to the next step of identifying diel patterns in dive behaviour by dissimilarity in time-at-depth. Additional code below is used to identify the daily light phase for each location ('day', 'night','dusk', or 'dawn') for later analyses such as plotting the dive profiles (Fig. 4), or calculating the number of days by light regime ('midnight sun', 'polar night', 'fall day/night cycle', 'spring day/night cycle'). Code for these latter steps are not included below.
+
+```{r solar altitude, include= TRUE}
+# Create a new column for the datetime + 10 minutes, this is required to see whether the sun is rising or setting at the time of each location (for dusk/dawn designation later)
+locs$date_plus_ten<-locs$date+10*60
+
+# Calculate the solar altitude for all time-stamped locations
+sun_angle<-getSunlightPosition(data = locs[c('date','lat','lon')], keep = 'altitude')
+
+# Convert the altitude from radians to degrees
+sun_angle$altitude<-(sun_angle$altitude*180)/pi
+
+# Calculate the solar altitude for each location at the given time + 10 mins, to identify dusk and dawn (i.e. whether the sun is setting or rising, respectively)
+plusten<-locs[c('date_plus_ten','lat','lon')]
+names(plusten)<-c("date","lat","lon")
+sun_angle_plus<-getSunlightPosition(data = plusten, keep = 'altitude')
+colnames(sun_angle_plus)[which(names(sun_angle_plus) == "altitude")] <- "altitude_plus"
+sun_angle_plus$altitude_plus<-(sun_angle_plus$altitude_plus*180)/pi
+
+# Bind columns
+solar_all<-cbind(locs, sun_angle[c('altitude')],sun_angle_plus[c('altitude_plus')])
+
+# Assign daily light phases based on solar altitude. <= -0.83 degrees is when sun appears completely below the horizon to an observer, due to refraction, hence altitudes greater than this are assigned as 'day'. -18 degrees is when none of the glow from the sun illuminates the sky, so values less than this are assigned as 'night', and altitudes > -18 and <= -0.83 are assigned 'twilight'
+solar_all$light_phase<-ifelse(solar_all$altitude>-0.83, 'day', 'night')
+solar_all$light_phase<-ifelse(solar_all$altitude > -18 & solar_all$light_phase == 'night', 'twilight', solar_all$light_phase)
+
+# Convert locations assigned 'twilight' to dusk or dawn, depending on whether the sun is setting or rising, respectively (altitude_plus is < altitude and > altitude, respectively)
+solar_all$light_phase<-ifelse(solar_all$light_phase == 'twilight' & solar_all$altitude_plus < solar_all$altitude, 'dusk', solar_all$light_phase)
+solar_all$light_phase<-ifelse(solar_all$light_phase == 'twilight' & solar_all$altitude_plus > solar_all$altitude, 'dawn', solar_all$light_phase)
+
+# Remove unnecessary columns
+solar_all$date_plus_ten<-NULL
+solar_all$altitude_plus<-NULL
+# Change 'date' column name back to 'datetime'
+colnames(solar_all)[which(names(solar_all) == 'date')] <- 'datetime'
+# save file
+write.csv(solar_all, here("csv_outputs","LC2018_3_CrwLocsSub_Solalt.csv"))
+```
+
+Identify whether each unique day by individual beluga had a seasonal light regime ('seasonlight') of 24 hour daylight, day/night cycle, or 24 hour darkness:
+- 24 hour daylight: solar altitude always > -0.83 degrees for all locations from a given day, all locations on that day have been assigned a 'light_phase' of 'day'
+- 24 hour darkness: solar altitude always <= -0.83 degrees for all locations from a given day, none of locations on that day have have been assigned a 'light_phase' of 'day'
+- day/night cycle: solar altitude altitude both <= and > -0.83 degrees for all locations from a given day, locations on that day have been assigned a 'light_phase' of 'day' AND 'dusk','dawn', or 'night'). 
+This can be used in later summary analyses to identify the number of days with diel behaviour by light regime. 
+
+```{r seasonal light regime, include=TRUE}
+
+solar_all$date<-as.Date(solar_all$datetime, tz = 'UTC')
+# Tally the number of locations recorded during each light phase by day per individual
+solar_all_frequency<-data.frame(table(ptt=solar_all$ptt,date=solar_all$date, light_phase=solar_all$light_phase))
+
+# Transpose light_phase column to identify how many 15 min interval locations per day were classified as 'day','dusk','dawn', and 'night'
+solar_all_frequencyT<-dcast(melt(as.data.table(solar_all_frequency), id.vars = c("ptt", "date", "light_phase")), 
+                            ptt + date ~ light_phase, value.var = "value", fun.aggregate = sum
+)
+
+# Label all dates with 0 locs of 'night', 'dusk' and 'dawn', '24LIGHT'. For now, label all else 'DAY_NIGHT'
+solar_all_frequencyT$seasonlight<-ifelse(solar_all_frequencyT$dawn == 0 & solar_all_frequencyT$dusk == 0 & solar_all_frequencyT$night == 0, '24LIGHT', 'DAY_NIGHT')
+
+# Then give all dates with 0 locs of 'day', '24DARK', otherwise give the previously assigned light phase
+solar_all_frequencyT$seasonlight<-ifelse(solar_all_frequencyT$day == 0 , '24DARK', solar_all_frequencyT$seasonlight)
+
+# As the table function prior to transpose created rows for all date-PTT-light_phase combinations, here the rows with 0s for all light phases are given a 'seasonlight' of NA and then removed (in the case of using multiple individuals with different time ranges)
+solar_all_frequencyT$seasonlight<-ifelse(solar_all_frequencyT$day == 0 & solar_all_frequencyT$dawn == 0 & solar_all_frequencyT$dusk == 0 & solar_all_frequencyT$night == 0, NA, solar_all_frequencyT$seasonlight)
+
+solar_all_frequencyT<-solar_all_frequencyT[!is.na(solar_all_frequencyT$seasonlight),]
+
+# Calculate hours of daylight experienced by each individual on each unique date. This is used in later generalized additive mixed effects modelling (not included in script)
+solar_all_frequencyT$hours_daylight<-(solar_all_frequencyT$day/(solar_all_frequencyT$day+solar_all_frequencyT$dawn+solar_all_frequencyT$dusk+solar_all_frequencyT$night))*24
+
+# Output results
+solar_all_frequencyT<-solar_all_frequencyT[,-c('day','dusk','dawn','night')]
+write.csv(solar_all_frequencyT, here("csv_outputs","LC2018_3_DailyLightRegime.csv"))
+rm(locs,plusten,solar_all,solar_all_frequency,solar_all_frequencyT,sun_angle,sun_angle_plus)
+```
+
+IDENTIFYING DIEL PATTERNS BASED ON DISSIMILARITY IN TAD
+
+This code takes depth time series data (at 75 s intervals, each individual hour of data is complete, but a number of hours are missing) and calculates the time-at-depth (TAD) in a series of bins for each hour.
+Each day of data for each individual is split into phases of low- and high solar altitude based on the midrange solar altitude encountered on that day. As such, diel patterns can be explored and identified during periods with 24-hour daylight or darkness rather than only relative to the day/night cycle. 
+Manhattan distances are calculated between the mean TAD for phases of low and high solar altitude for each day, using the solar altitudes identified in the previous steps. 
+Manhattan distances are then calculated between the mean TAD for equivalent solar altitude phases on a given day and the surrounding days, and the Manhattan distance calculated on the given day between phases of low and high solar altitude is compared to these  distances. For instance, given a hypothetical sequence of days with 12 hours of daylight (sun above the horizon) and 12 hours of darkness (sun below the horizon), this would test whether there is a greater dissimilarity in TAD between phases of daylight and darkness on the given day than there is between phases of daylight on consecutive days and darkness on consecutive days. As such, this tests whether differences in TAD over a diel cycle are due to solar altitude or chance.
+
+
+Load depth time series data:
+This is a subset of depth data (75 s intervals), for beluga ID LC2018#3 (PTT 174962) from Aug 4th to Oct 30th (the time range shown in Fig. 4 of the manuscript), with two columns: 'datetime' and 'depth'
+```{r load depth data, keep=TRUE}
+#Load depth data
+ts<-read.csv(here("data_inputs", "LC2018_3_Depth_ts_Sub.csv"))
+#Set time zone
+ts$datetime<-as.POSIXct(ts$datetime, tz = 'UTC')
+```
+
+Convert each depth to the upper limit of the TAD bins to be used (here 0-20, 20-50, 50-100, 100-200, 200-300, 300-400, 400-500 and > 500) (> 500 bin given a value of 1000). Then calculate how much time is spent at each depth for each hour.
+```{r calculate hourly TAD, keep=TRUE}
+#Convert depth values to bin values 
+ts$depth<-ifelse(ts$depth<= 20, 20, ts$depth)
+ts$depth<-ifelse(ts$depth<= 50 & ts$depth > 20, 50, ts$depth)
+ts$depth<-ifelse(ts$depth<= 100 & ts$depth > 50, 100, ts$depth)
+ts$depth<-ifelse(ts$depth<= 200 & ts$depth > 100, 200, ts$depth)
+ts$depth<-ifelse(ts$depth<= 300 & ts$depth > 200, 300, ts$depth)
+ts$depth<-ifelse(ts$depth<= 400 & ts$depth > 300, 400, ts$depth)
+ts$depth<-ifelse(ts$depth<= 500 & ts$depth > 400, 500, ts$depth)
+ts$depth<-ifelse(ts$depth > 500, 1000, ts$depth) 
+
+ts<-ts[complete.cases(ts),] #remove rows with missing depths. Note that these may be present in the Series.csv data transmitted by Wildlife Computers tags if another time series data stream such as temperature was transmitted and received for that time period but depth was not, or if the data has previously been tidied to include all times at regular intervals over the study period. 
+
+# Create an hour field 
+ts$hour<-as.character(format(ts$datetime, "%Y-%m-%d %H"))
+
+# Tally the number of depths recorded in each TAD bin by hour. These sum to 48 for time series data transmitted in hourly messages of data at 75 s intervals
+ts_cast<-reshape2::dcast(ts, hour~depth, value.var = 'depth', fun.aggregate = length)
+
+# Calculate the proportion of time spent in each bin per hour by dividing by 48 (i.e. when there is one depth every 75s for a given hour)
+ts_cast[,-1]<-ts_cast[,-1]/48
+
+# Give column names "tad_"
+colnames(ts_cast)<-paste('tad', colnames(ts_cast), sep = '_')
+
+# Order rows by hour
+ts_cast<-ts_cast[order(ts_cast$tad_hour),]
+```
+
+Associating solar altitude to hourly TAD data:
+This uses the file with locations and solar altitude created previously
+```{r load solar altitude data, keep=TRUE}
+# Load CTCRW-modeled locations at regular (15 min) intervals, which have had solar altitude assigned using the suncalc package
+crw<-read.csv(here("csv_outputs","LC2018_3_CrwLocsSub_Solalt.csv"))
+```
+
+The script from this point onwards currently only works for one individual at a time, so the individual identifier is specified below
+```{r individual, keep=TRUE}
+crw<-crw[crw$ptt == '174962',]
+crw$datetime<-as.POSIXct(crw$datetime,tz = 'UTC')
+```
+
+Identify the solar altitude recorded at the location reported nearest the middle of the hour (HH:30)
+```{r tad and solar, keep=TRUE}
+# Create date and hour columns for each location 
+crw$hour<-as.character(format(crw$datetime, "%Y-%m-%d %H"))
+crw$date<-strftime(crw$datetime, format = '%Y-%m-%d', tz = 'UTC')
+
+#Create a data frame in half hour intervals from the first to the last location. Note that 'floor_date' should be used if the first time occurs after HH:30, and 'ceiling_date' used if it occurs before HH:30.
+half_hour<-data.frame(hour = seq(from = ceiling_date(as.POSIXct(min(crw$datetime), tz = 'UTC'), "30 minutes"), to = max(crw$datetime), by = '1 hours'))
+
+# Match the data at half hour intervals to the nearest data from the locations with solar altitudes 
+df1<-setDT(half_hour)
+df2<-setDT(crw)
+
+setkey(df1, hour)
+setkey(df2, datetime)
+half_hour_solar_alt<-df2[df1, roll= 'nearest']
+
+# Identify the midrange altitude per day (i.e. (min_alt+max_alt)/2)
+day_alt <- half_hour_solar_alt %>% group_by(date) %>% summarize(
+  day_max_alt = max(altitude, na.rm = TRUE), 
+  day_min_alt = min(altitude, na.rm = TRUE))
+
+day_alt$day_mid_alt<-(day_alt$day_max_alt+day_alt$day_min_alt)/2
+day_alt<-day_alt[c('date','day_mid_alt')]
+
+# Match day_alt data frame (which has the midrange solar altitude for each day) with the half_hour_solar_alt data frame (which has the solar altitude for each hour)
+df1<-setDT(day_alt)
+df2<-setDT(half_hour_solar_alt)
+
+setkey(df1, date)
+setkey(df2, date)
+hours_solaralt<-df2[df1, roll=FALSE]
+```
+
+Classify each hour of the TAD data as lowalt or highalt depending on whether that hour of data occurred when the solar altitude was lower or higher than the mid_alt for the day, respectively
+```{r classify solar altitude, keep=TRUE}
+hours_solaralt$low_high_alt<-ifelse(hours_solaralt$altitude<=hours_solaralt$day_mid_alt, 'low','high')
+
+
+hours_solaralt<-hours_solaralt[,c('datetime','hour','low_high_alt')]
+
+# Join the (low/high) solar altitude data to the TAD data frame 
+df1<-setDT(ts_cast)
+df2<-setDT(hours_solaralt)
+
+setkey(df1, tad_hour)
+setkey(df2, hour)
+full_tad<-df2[df1, roll=FALSE]
+
+# Split the data based on high and low solar altitude 
+highalt_tad<-full_tad[full_tad$low_high_alt == 'high',]
+lowalt_tad<-full_tad[full_tad$low_high_alt == 'low',]
+
+highalt_tad<-highalt_tad[,-c('hour','low_high_alt')]
+highalt_tad$date<-as.Date(highalt_tad$datetime)
+lowalt_tad<-lowalt_tad[,-c('hour','low_high_alt')]
+lowalt_tad$date<-as.Date(lowalt_tad$date)
+```
+
+Calculate the mean daily TAD for each of the lowalt and highalt phases
+
+```{r mean daily TAD, keep=TRUE,warning=FALSE}
+# Calculate the mean daily TAD for the highalt phases
+highaltmean<-data.frame(date = as.Date(unique(highalt_tad$date), tz = 'UTC'))
+
+day_list <- as.Date(unique(highaltmean$date), tz = 'UTC')
+
+# Create empty columns for each TAD bin (note the number denotes upper limit for the bin, except for 1000 which includes all values > 500)
+highaltmean$tad_20<-NA
+highaltmean$tad_50<-NA
+highaltmean$tad_100<-NA
+highaltmean$tad_200<-NA
+highaltmean$tad_300<-NA
+highaltmean$tad_400<-NA
+highaltmean$tad_500<-NA
+highaltmean$tad_1000<-NA
+
+for(i in seq_along(day_list)) {
+  sub<-subset(highalt_tad, date == day_list[i])
+  highaltmean[i,]<- sub %>%
+    summarise_all(.funs = c(mean="mean"))
+  highaltmean$date<-day_list
+}
+
+# Calculate the mean daily TAD for the lowalt phases 
+lowaltmean<-data.frame(date = as.Date(unique(lowalt_tad$date), tz = 'UTC'))
+
+day_list <- as.Date(unique(lowaltmean$date), tz = 'UTC')
+
+# Create empty columns for each TAD bin (note the number denotes upper limit for the bin, except for 1000 which includes all values > 500)
+lowaltmean$tad_20<-NA
+lowaltmean$tad_50<-NA
+lowaltmean$tad_100<-NA
+lowaltmean$tad_200<-NA
+lowaltmean$tad_300<-NA
+lowaltmean$tad_400<-NA
+lowaltmean$tad_500<-NA
+lowaltmean$tad_1000<-NA
+
+for(i in seq_along(day_list)) {
+  sub<-subset(lowalt_tad, date == day_list[i])
+  lowaltmean[i,]<- sub %>%
+    summarise_all(.funs = c(mean="mean"))
+  lowaltmean$date<-day_list
+}
+```
+
+Create a sequence of all dates for the lowalt and highalt means. This is necessary as if on a given day there was no TAD data in either the lowalt or highalt phase, that phase will not be included in the data frame. A sequence of all the days with either the mean TAD or NA (if data is missing) for the highalt and lowalt phases is required for the later steps.
+
+```{r seq alts, keep=TRUE}
+
+seq_all_day<-seq(min(as.Date(full_tad$date, tz = 'UTC'), na.rm=TRUE), max(as.Date(full_tad$date, tz = 'UTC'),na.rm=TRUE), by = 'days')    
+seq_all_day<-as.data.frame(seq_all_day)
+colnames(seq_all_day)<-'date'
+
+df1<-setDT(seq_all_day)
+df2<-setDT(highaltmean)
+
+setkey(df1, date)
+setkey(df2, date)
+highaltmean_alldays<-df2[df1, roll=FALSE]
+
+df1<-setDT(seq_all_day)
+df2<-setDT(lowaltmean)
+
+setkey(df1, date)
+setkey(df2, date)
+lowaltmean_alldays<-df2[df1, roll=FALSE]
+```
+
+Calculate the Manhattan distances / 2 between the lowalt and highalt phases on each date. Dividing the Manhattan distances by two is optional; it can provide more intuitive interpretation as the TAD vectors for the highalt + lowalt phases sum to two, diving the Manhattan distance by two gives the absolute proportional difference in TAD between the phases. 
+
+```{r manhattan dist, keep=TRUE}
+
+# Calculate the Manhattan distance / 2 between lowalt and highalt phases for each day
+day_list<-as.character(unique(seq_all_day$date))
+Man_dist<-data.frame(dist=day_list)
+
+for (i in seq_along(day_list)){
+  unique_date1<-t(subset(highaltmean_alldays[,-c('date')], highaltmean_alldays$date == day_list[i]))
+  unique_date2<-t(subset(lowaltmean_alldays[,-c('date')], lowaltmean_alldays$date == day_list[i]))
+  df<-t(data.frame(high = unique_date1,
+                   low = unique_date2))
+  Man_dist[i,]<- dist(df, method = "manhattan")/2
+}
+Man_dist$dist<-as.numeric(Man_dist$dist)
+Man_dist<-data.frame(date = day_list,  dist = Man_dist$dist)
+
+```
+
+
+Calculate the Manhattan distances / 2 between equivalent solar altitude phases on day d with day d-1, d-2, d+1 and d+2. (I.e., lowalt on day d with lowalt on day d-1 etc.)
+```{r man dist surrounding days, keep=TRUE}
+
+## Calculate Manhattan Distance between the TAD vectors from highalt on day d and highalt on day d-1 
+day_list<-as.Date(unique(seq_all_day$date), tz = 'UTC')
+l <- length(seq_all_day$date)
+
+# It is necessary to remove first and last two dates as all comparisons are made among +/- 1 and 2 days
+day_list<-day_list[-c(1:2,l, l-1)] 
+highalt_prev1<-data.frame(highalt_prev1dist = day_list)
+highalt_prev1$highalt_prev1dist<-NA
+
+for (i in seq_along(day_list)){
+  unique_date1<-t(subset(highaltmean_alldays[,-c('date')], highaltmean_alldays$date == as.Date(day_list[i])))
+  unique_date2<-t(subset(highaltmean_alldays[,-c('date')], highaltmean_alldays$date == as.Date(day_list[i])- days(1)))
+  df<-t(data.frame(unique_date1,
+                   unique_date2))
+  highalt_prev1[i,]<- dist(df, method = "manhattan")/2
+}
+
+## Calculate Manhattan Distance between the TAD vectors from highalt on day d and highalt on day d-2 
+day_list<-as.Date(unique(seq_all_day$date), tz = 'UTC')
+l <- length(seq_all_day$date)
+
+# It is necessary to remove first and last two dates as all comparisons are made among +/- 1 and 2 days
+day_list<-day_list[-c(1:2,l, l-1)] 
+highalt_prev2<-data.frame(highalt_prev2dist = day_list)
+highalt_prev2$highalt_prev2dist<-NA
+
+for (i in seq_along(day_list)){
+  unique_date1<-t(subset(highaltmean_alldays[,-c('date')], highaltmean_alldays$date == as.Date(day_list[i])))
+  unique_date2<-t(subset(highaltmean_alldays[,-c('date')], highaltmean_alldays$date == as.Date(day_list[i])- days(2)))
+  df<-t(data.frame(unique_date1,
+                   unique_date2))  
+  highalt_prev2[i,]<- dist(df, method = "manhattan")/2
+}
+
+## Calculate Manhattan Distance between the TAD vectors from highalt on day d and highalt on day d+1 
+day_list<-as.Date(unique(seq_all_day$date), tz = 'UTC')
+l <- length(seq_all_day$date)
+
+# It is necessary to remove first and last two dates as all comparisons are made among +/- 1 and 2 days
+day_list<-day_list[-c(1:2,l, l-1)] 
+highalt_next1<-data.frame(highalt_next1dist = day_list)
+highalt_next1$highalt_next1dist<-NA
+
+for (i in seq_along(day_list)){
+  unique_date1<-t(subset(highaltmean_alldays[,-c('date')], highaltmean_alldays$date == as.Date(day_list[i])))
+  unique_date2<-t(subset(highaltmean_alldays[,-c('date')], highaltmean_alldays$date == as.Date(day_list[i])+ days(1)))
+  df<-t(data.frame(unique_date1,
+                   unique_date2))
+  
+  highalt_next1[i,]<- dist(df, method = "manhattan")/2
+}
+
+## Calculate Manhattan Distance between the TAD vectors from highalt on day d and highalt on day d+2 
+day_list<-as.Date(unique(seq_all_day$date), tz = 'UTC')
+l <- length(seq_all_day$date)
+
+# It is necessary to remove first and last two dates as all comparisons are made among +/- 1 and 2 days
+day_list<-day_list[-c(1:2,l, l-1)] 
+highalt_next2<-data.frame(highalt_next2dist = day_list)
+highalt_next2$highalt_next2dist<-NA
+
+for (i in seq_along(day_list)){
+  unique_date1<-t(subset(highaltmean_alldays[,-c('date')], highaltmean_alldays$date == as.Date(day_list[i])))
+  unique_date2<-t(subset(highaltmean_alldays[,-c('date')], highaltmean_alldays$date == as.Date(day_list[i])+ days(2)))
+  df<-t(data.frame(unique_date1,
+                   unique_date2))
+  highalt_next2[i,]<- dist(df, method = "manhattan")/2
+}
+
+## Calculate Manhattan Distance between the TAD vectors from lowalt on day dand lowalt on day d-1 
+day_list<-as.Date(unique(seq_all_day$date), tz = 'UTC')
+l <- length(seq_all_day$date)
+
+# It is necessary to remove first and last two dates as all comparisons are made among +/- 1 and 2 days
+day_list<-day_list[-c(1:2,l, l-1)] 
+lowalt_prev1<-data.frame(lowalt_prev1dist = day_list)
+lowalt_prev1$lowalt_prev1dist<-NA
+
+for (i in seq_along(day_list)){
+  unique_date1<-t(subset(lowaltmean_alldays[,-c('date')], lowaltmean_alldays$date == as.Date(day_list[i])))
+  unique_date2<-t(subset(lowaltmean_alldays[,-c('date')], lowaltmean_alldays$date == as.Date(day_list[i])- days(1)))
+  df<-t(data.frame(unique_date1,
+                   unique_date2))
+  lowalt_prev1[i,]<- dist(df, method = "manhattan")/2
+}
+
+## Calculate Manhattan Distance between the TAD vectors from lowalt on day d and lowalt on day d-2 
+day_list<-as.Date(unique(seq_all_day$date), tz = 'UTC')
+l <- length(seq_all_day$date)
+
+# It is necessary to remove first and last two dates as all comparisons are made among +/- 1 and 2 days
+day_list<-day_list[-c(1:2,l, l-1)] 
+lowalt_prev2<-data.frame(lowalt_prev2dist = day_list)
+lowalt_prev2$lowalt_prev2dist<-NA
+
+for (i in seq_along(day_list)){
+  unique_date1<-t(subset(lowaltmean_alldays[,-c('date')], lowaltmean_alldays$date == as.Date(day_list[i])))
+  unique_date2<-t(subset(lowaltmean_alldays[,-c('date')], lowaltmean_alldays$date == as.Date(day_list[i])- days(2))) 
+  df<-t(data.frame(unique_date1,
+                   unique_date2))
+  lowalt_prev2[i,]<- dist(df, method = "manhattan")/2
+}
+
+## Calculate Manhattan Distance between the TAD vectors from lowalt on day d and lowalt on day d+1 
+day_list<-as.Date(unique(seq_all_day$date), tz = 'UTC')
+l <- length(seq_all_day$date)
+
+# It is necessary to remove first and last two dates as all comparisons are made among +/- 1 and 2 days
+day_list<-day_list[-c(1:2,l, l-1)] 
+lowalt_next1<-data.frame(lowalt_next1dist = day_list)
+lowalt_next1$lowalt_next1dist<-NA
+
+for (i in seq_along(day_list)){
+  unique_date1<-t(subset(lowaltmean_alldays[,-c('date')], lowaltmean_alldays$date == as.Date(day_list[i])))
+  unique_date2<-t(subset(lowaltmean_alldays[,-c('date')], lowaltmean_alldays$date == as.Date(day_list[i])+ days(1)))
+  df<-t(data.frame(unique_date1,
+                   unique_date2))
+  lowalt_next1[i,]<- dist(df, method = "manhattan")/2
+}
+
+## Calculate Manhattan Distance between the TAD vectors from lowalt on day d and lowalt on day d+2 
+day_list<-as.Date(unique(seq_all_day$date), tz = 'UTC')
+l <- length(seq_all_day$date)
+
+# It is necessary to remove first and last two dates as all comparisons are made among +/- 1 and 2 days
+day_list<-day_list[-c(1:2,l, l-1)] 
+lowalt_next2<-data.frame(lowalt_next2dist = day_list)
+lowalt_next2$lowalt_next2dist<-NA
+
+for (i in seq_along(day_list)){
+  unique_date1<-t(subset(lowaltmean_alldays[,-c('date')], lowaltmean_alldays$date == as.Date(day_list[i])))
+  unique_date2<-t(subset(lowaltmean_alldays[,-c('date')], lowaltmean_alldays$date == as.Date(day_list[i])+ days(2))) 
+  df<-t(data.frame(unique_date1,
+                   unique_date2))
+  lowalt_next2[i,]<- dist(df, method = "manhattan")/2
+}
+
+```
+
+
+Combine all calculated distances into a single data frame
+```{r manhattan dist combine, keep=TRUE}
+
+# Remove the first and last two rows from the lowalt vs. highalt Manhattan distances data frame so that this data frame can be matched with the data frames of Manhattan distances calculated between equivalent phases. We cannot identify diel patterns on these dates as there is no data on the preceding (start of sequence) or following (end of sequence) days to compare to. Although note that if there is sufficient data (here >= 3 hours, see next step on calculating number of hours of data) in each of the lowalt and highalt phases on the first and last days of the sequence, then the second and second-to-last days of the sequence will be available for diel pattern identification. In this case, it is only the first and last dates of the sequence that should be converted to NA. Alternatively, an additional two days could be added to the start and end of each of the 'highalt_hour_count' and 'lowalt_hour_count' data frames created in the next step, each with 0 hours of data. In this case, the following two lines of code (head and tail functions) can be removed, and the later code will detect whether too few hours were present to enable identification of patterns on the second and second-to-last dates
+Man_dist<-head(Man_dist,-2)
+Man_dist<-tail(Man_dist,-2)
+
+dist_all<-cbind(Man_dist, highalt_prev1,highalt_prev2,highalt_next1,highalt_next2,lowalt_prev1,lowalt_prev2,lowalt_next1,lowalt_next2) 
+dist_all$date<-as.Date(dist_all$date, tz = 'UTC') 
+
+# Re-add the first and last two dates from above, as these were used in calculating distances between equivalent phases and we need to know how many hours of data these contained in the next step
+df1<-setDT(seq_all_day)
+df2<-setDT(dist_all)
+
+setkey(df1, date)
+setkey(df2, date)
+dist_all<-df2[df1, roll=FALSE]
+```
+
+
+Calculate the number of hours of data for each of the lowalt and highalt phases by day so that dates with too few hours can be excluded from analyses
+
+```{r hours of data, keep=TRUE}
+# Calculate the number of hours of data in each lowalt and highalt period per day
+
+highalt_hour_count<-highalt_tad %>% group_by(date) %>% summarize(count=n())
+colnames(highalt_hour_count)<-c('date', 'highalt_hour_count')
+lowalt_hour_count<-lowalt_tad %>% group_by(date) %>% summarize(count=n())
+colnames(lowalt_hour_count)<-c('date', 'lowalt_hour_count')
+
+# Join hour counts to data frame with all distances
+df1<-setDT(dist_all)
+df2<-setDT(highalt_hour_count)
+
+setkey(df1, date)
+setkey(df2, date)
+dist_all<-df2[df1, roll=FALSE]
+
+df1<-setDT(dist_all)
+df2<-setDT(lowalt_hour_count)
+
+setkey(df1, date)
+setkey(df2, date)
+dist_all<-df2[df1, roll=FALSE]
+
+# Create new columns specifying the hours of data for the lowalt and highalt phases on the surrounding days
+dist_all$highalt_prev1_hourcount<-lag(dist_all$highalt_hour_count)
+dist_all$highalt_prev2_hourcount<-lag(dist_all$highalt_hour_count,2)
+dist_all$highalt_next1_hourcount<-lead(dist_all$highalt_hour_count)
+dist_all$highalt_next2_hourcount<-lead(dist_all$highalt_hour_count,2)
+
+dist_all$lowalt_prev1_hourcount<-lag(dist_all$lowalt_hour_count)
+dist_all$lowalt_prev2_hourcount<-lag(dist_all$lowalt_hour_count,2)
+dist_all$lowalt_next1_hourcount<-lead(dist_all$lowalt_hour_count)
+dist_all$lowalt_next2_hourcount<-lead(dist_all$lowalt_hour_count,2)
+
+# Convert the distances calculated on a given day to NA if there were too few hours (< 3) in either the lowalt or highalt phases on that day
+dist_all$dist<-ifelse(dist_all$lowalt_hour_count < 3 | dist_all$highalt_hour_count < 3, NA, dist_all$dist)
+```
+
+Calculate the four surrounding distances (lowalt-lowalt, highalt-highalt) to compare the daily distances (lowalt-highalt) to. If d-1 has too few hours (< 3), then use d-2 (and the same for d+1) for lowalt and highalt phases, ensuring that at the end there are four distances (a lowalt for a previous day and a following day, and a highalt for a previous day and a following day). If there are not four distances in total for a given day it is deemed data deficient and not compared with surrounding days. 
+```{r surrounding distances, keep=TRUE}
+
+# Identify whether to use the highalt Manhattan distance calculated between d and d-1 or d and d-2
+dist_all$highalt_prev_dist_FINAL<-ifelse(dist_all$highalt_prev1_hourcount < 3, dist_all$highalt_prev2dist, dist_all$highalt_prev1dist)
+dist_all$highalt_prev_dist_FINAL<-ifelse(dist_all$highalt_prev2_hourcount < 3 & dist_all$highalt_prev1_hourcount < 3,
+                                         NA, dist_all$highalt_prev_dist_FINAL)
+
+# Identify whether to use the highalt Manhattan distance calculated between d and d+1 or d and d+2
+dist_all$highalt_next_dist_FINAL<-ifelse(dist_all$highalt_next1_hourcount < 3, dist_all$highalt_next2dist, dist_all$highalt_next1dist)
+dist_all$highalt_next_dist_FINAL<-ifelse(dist_all$highalt_next2_hourcount < 3 & dist_all$highalt_next1_hourcount < 3,
+                                         NA, dist_all$highalt_next_dist_FINAL)
+
+# Identify whether to use the lowalt Manhattan distance calculated between d and d-1 or d and d-2
+dist_all$lowalt_prev_dist_FINAL<-ifelse(dist_all$lowalt_prev1_hourcount < 3, dist_all$lowalt_prev2dist, dist_all$lowalt_prev1dist)
+dist_all$lowalt_prev_dist_FINAL<-ifelse(dist_all$lowalt_prev2_hourcount < 3 & dist_all$lowalt_prev1_hourcount < 3,
+                                        NA, dist_all$lowalt_prev_dist_FINAL)
+
+# Identify whether to use the lowalt Manhattan distance calculated between d and d+1 or d and d+2
+dist_all$lowalt_next_dist_FINAL<-ifelse(dist_all$lowalt_next1_hourcount < 3, dist_all$lowalt_next2dist, dist_all$lowalt_next1dist)
+dist_all$lowalt_next_dist_FINAL<-ifelse(dist_all$lowalt_next2_hourcount < 3 & dist_all$lowalt_next1_hourcount < 3,
+                                        NA, dist_all$lowalt_next_dist_FINAL)
+
+# Assign days as having possible diel behaviour ('sig_dist' = significant distance) if the dist between highalt and lowalt on d is greater than the four distances calculated between equivalent phases
+
+dist_all$sig_dist<-ifelse(dist_all$dist > dist_all$highalt_prev_dist_FINAL &
+                            dist_all$dist > dist_all$highalt_next_dist_FINAL &
+                            dist_all$dist > dist_all$lowalt_prev_dist_FINAL & 
+                            dist_all$dist > dist_all$lowalt_next_dist_FINAL,
+                          1,0)
+
+# Identify days as having insufficient data (NA) if one of the four distances to compare to is NA (i.e., it was calculated using too few hours of data, < 3)
+dist_all$sig_dist<-ifelse(is.na(dist_all$highalt_prev_dist_FINAL) |
+                            is.na(dist_all$highalt_next_dist_FINAL) |
+                            is.na(dist_all$lowalt_prev_dist_FINAL) | 
+                            is.na(dist_all$lowalt_next_dist_FINAL),
+                          NA,dist_all$sig_dist)
+
+# Plot the Manhattan Distance / 2 against date. This is useful for visualizing presence and changes in magnitude of diel patterns. Here you can see that until early September, this individual had less than ~25% difference in its TAD between the lowalt and highalt phases. From September 7th to October 9th, this individual displayed greater than ~45% difference in TAD between the lowalt and highalt phases, with a brief period of low dissimilarity around September 22nd (see Fig. 4 of manuscript)
+plot(dist_all$dist~dist_all$date, xlab = 'Date', ylab = 'Manhattan distance / 2')
+```
+
+To further discriminate among whether a day contains true diel patterns, only classify a day as having diel patterns if it was either preceded or followed by a day which also had a 'significant distance' from above:
+```{r diel days, keep=TRUE}
+# Create a data frame with all dates and use 'lead' and 'lag' to identify the value for 'sig_dist' from the previous and next day.
+day_list<-data.frame(seq_all_day)
+colnames(day_list)<-'date'
+
+df1<-setDT(day_list)
+df2<-setDT(dist_all)
+
+setkey(df1, date)
+setkey(df2, date)
+dist_complete<-df2[df1, roll=FALSE]
+
+dist_complete$nextsig_dist<-lead(dist_complete$sig_dist,1)
+dist_complete$prevsig_dist<-lag(dist_complete$sig_dist,1)
+
+# Assign a diel value of 1 or 0 only when there are two or more consecutive days with a 'significant distance'. In cases where a single day with a 'sig_dist' is preceded or followed by a day with insufficient data, this is deemed data deficient and given a value of NA
+dist_complete$diel<-ifelse(dist_complete$sig_dist == 1 & (dist_complete$nextsig_dist == 1 | dist_complete$prevsig_dist == 1),1, 0)
+dist_complete$diel<-ifelse(is.na(dist_complete$sig_dist), NA, dist_complete$diel)
+
+dist_complete<-dist_complete[,c('date','dist','diel')]
+
+# Specify the individual identifier
+dist_complete$PTT <- '174962'
+
+# Save file 
+write.csv(dist_complete, here("csv_outputs","LC2018_3_DielDates.csv"))
+```
